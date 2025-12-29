@@ -60,67 +60,84 @@ The model is no longer responsible for inferring the correct mode — it is decl
 
 ---
 
-## 4. OpenAI Function Calling Example
+## 4. OpenAI Function Calling Example (C# and Python)
 
-### 4.1 Tool Definition
+This section demonstrates intent-driven tool use using both **C#** (common in production agent backends) and **Python** (common for rapid prototyping and orchestration).
 
-```python
-tools = [
+### 4.1 Tool Definition (Conceptual)
+
+The intent pattern is provider-agnostic. The tool schema conceptually looks like this:
+
+* A required `intent` field
+* Strict enforcement in the executor, not the model
+
+---
+
+### 4.2 C# Example (OpenAI Tool Calling)
+
+```csharp
+var tools = new[]
+{
+    new
     {
-        "type": "function",
-        "name": "execute_command",
-        "description": "Execute a shell command",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to execute"
+        type = "function",
+        name = "execute_command",
+        description = "Execute a shell command",
+        parameters = new
+        {
+            type = "object",
+            properties = new
+            {
+                command = new
+                {
+                    type = "string",
+                    description = "Shell command to execute"
                 },
-                "intent": {
-                    "type": "string",
-                    "enum": ["DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE"],
-                    "description": "Behavioral execution mode"
+                intent = new
+                {
+                    type = "string",
+                    @enum = new[] { "DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE" },
+                    description = "Behavioral execution mode"
                 }
             },
-            "required": ["command", "intent"]
+            required = new[] { "command", "intent" }
         }
     }
-]
+};
 ```
 
-### 4.2 System Prompt Enforcement
+### 4.3 C# Execution Layer (Kill Switch / Circuit Breaker)
 
-```text
-When calling tools, you MUST include an intent.
+```csharp
+public string HandleToolCall(string command, string intent)
+{
+    return intent switch
+    {
+        "DIRECT" => ExecuteDirect(command),
+        "EXPLORATORY" => Simulate(command),
+        "ASSISTIVE" => ExplainAndConfirm(command),
+        "INNOVATIVE" => SuggestAlternatives(command),
+        _ => "CANNOT_PROCEED: unknown intent"
+    };
+}
 
-DIRECT:
-- Execute exactly as requested
-- No suggestions or explanations
-- If information is missing, respond: CANNOT_PROCEED: <reason>
+private string ExecuteDirect(string command)
+{
+    if (string.IsNullOrWhiteSpace(command))
+        return "CANNOT_PROCEED: missing command";
 
-EXPLORATORY:
-- Investigate only
-- Do not mutate state
-
-INNOVATIVE:
-- Propose alternatives
-- Label speculation
-
-ASSISTIVE:
-- Explain effects
-- Warn before destructive actions
-
-Never override user intent.
+    return RunShell(command);
+}
 ```
 
-### 4.3 Execution Layer (Kill Switch)
+In **DIRECT** mode, execution halts immediately on missing information. No retries. No inference. This is the circuit breaker.
+
+---
+
+### 4.4 Python Example (Reference Implementation)
 
 ```python
-def handle_tool_call(call):
-    intent = call["arguments"]["intent"]
-    command = call["arguments"]["command"]
-
+def handle_tool_call(command: str, intent: str):
     if intent == "DIRECT":
         if not command:
             return "CANNOT_PROCEED: missing command"
@@ -134,44 +151,60 @@ def handle_tool_call(call):
 
     if intent == "INNOVATIVE":
         return suggest_alternatives(command)
-```
 
-This logic functions as a **circuit breaker**: execution is impossible unless the declared intent permits it.
+    return "CANNOT_PROCEED: unknown intent"
+```
 
 ---
 
-## 5. Anthropic Claude Example
+## 5. Anthropic Claude Example (C#)
 
-```python
-tools = [
+Claude supports structured tool schemas similar to OpenAI. The same intent enforcement applies.
+
+```csharp
+var tools = new[]
+{
+    new
     {
-        "name": "file_operations",
-        "description": "Read, write, or delete files",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "operation": {"type": "string", "enum": ["read", "write", "delete"]},
-                "path": {"type": "string"},
-                "intent": {
-                    "type": "string",
-                    "enum": ["DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE"]
+        name = "file_operations",
+        description = "Read, write, or delete files",
+        input_schema = new
+        {
+            type = "object",
+            properties = new
+            {
+                operation = new { type = "string", @enum = new[] { "read", "write", "delete" } },
+                path = new { type = "string" },
+                intent = new
+                {
+                    type = "string",
+                    @enum = new[] { "DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE" }
                 }
             },
-            "required": ["operation", "path", "intent"]
+            required = new[] { "operation", "path", "intent" }
         }
     }
-]
+};
 ```
 
-Claude is explicitly instructed to halt after DIRECT execution and never retry with alternatives unless intent allows it.
+DIRECT intent means: perform exactly one file operation and stop. If the path is missing or ambiguous, execution fails hard.
 
 ---
 
-## 6. Gemini and Grok Compatibility
+## 6. Gemini and Grok Compatibility (C# Perspective)
 
-Because intent is application‑level metadata, the pattern is portable across providers. Any API that supports structured tool schemas can enforce intent deterministically in the executor layer.
+Because `intent` is application-level metadata, the same executor logic can be reused across providers.
 
-The model suggests actions; your system decides whether they are allowed.
+### Unified Executor Interface (C#)
+
+```csharp
+public interface IIntentExecutor
+{
+    string Execute(string payload, string intent);
+}
+```
+
+Each provider adapter only maps model output to this interface. The behavioral guarantees live entirely in your code, not the model.
 
 ---
 
