@@ -1,92 +1,146 @@
-# Mitigating Hallucinations: Intent-Driven Tool Use
+# Mitigating Hallucinations: Intent‑Driven Tool Use
 
-A simple, universal pattern for reducing AI hallucinations by adding explicit intent signals to tool calls.
+## Abstract
 
-## The Problem
+As large language models (LLMs) are increasingly embedded into automated systems, agent frameworks, and production tooling, a persistent failure mode has emerged: *unwanted helpfulness*. Models hallucinate API calls, invent parameters, retry failed actions creatively, or drift beyond the user’s original request. These behaviors are acceptable in conversational contexts but dangerous in deterministic or destructive environments.
 
-LLMs default to "helpful" behavior - they fill gaps, suggest alternatives, and reframe problems. This causes:
-- Hallucinated API calls
-- Invented parameters
-- "Let me try another way" loops
-- Responses that drift from the actual request
-
-## The Solution
-
-Add a single `intent` parameter to your tool definitions. That's it.
-
-```
-INTENT OPTIONS:
-- DIRECT: Execute exactly as requested. No alternatives, no commentary.
-- EXPLORATORY: Gather options. Don't commit to a solution.
-- INNOVATIVE: Propose novel approaches. Label speculation clearly.
-- ASSISTIVE: Explain what would happen. Clarify before acting.
-```
-
-## How It Works
-
-**Without intent:**
-```
-User: "Delete all logs"
-AI: *deletes logs, then suggests setting up log rotation, offers to configure cleanup scripts*
-```
-
-**With intent=DIRECT:**
-```
-User: "Delete all logs" [intent: DIRECT]
-AI: *deletes logs, stops*
-```
-
-**With intent=ASSISTIVE:**
-```
-User: "Delete all logs" [intent: ASSISTIVE]
-AI: "This will permanently remove all files in /var/log/*. Confirm?"
-```
+This paper introduces **Intent‑Driven Tool Use**, a simple and universal design pattern for constraining LLM behavior by adding an explicit `intent` signal to every tool invocation and, optionally, to normal chat. The pattern requires no model fine‑tuning, no external classifiers, and no architectural changes to existing APIs. Instead, it formalizes behavioral boundaries at the interface layer, enabling deterministic execution, safe exploration, guided assistance, or creative ideation — *explicitly and on demand*.
 
 ---
 
-## Implementation Examples
+## 1. The Problem: Helpful by Default
 
-### OpenAI Function Calling
+Modern LLMs are optimized for conversational usefulness. When a request is ambiguous or incomplete, they:
+
+* Fill in missing parameters
+* Infer user intent without confirmation
+* Retry failed actions using alternatives
+* Provide suggestions beyond the scope of the request
+
+In automated systems, this manifests as:
+
+* Hallucinated API calls
+* Invented arguments or file paths
+* Infinite “let me try another way” loops
+* Silent deviation from the original instruction
+
+While schema validation helps, it does not address *behavioral drift*. The model may still choose to explore, explain, or innovate when none of those are desired.
+
+---
+
+## 2. Core Idea: Make Intent Explicit
+
+The solution is intentionally minimal: **add a single, required `intent` parameter to every tool call**.
+
+The `intent` parameter does not describe *what* to do — it describes *how the model is allowed to behave while doing it*.
+
+### 2.1 Intent Taxonomy
+
+The following four intents cover the vast majority of operational needs:
+
+* **DIRECT** — Execute exactly as requested. No commentary, no alternatives, no retries.
+* **EXPLORATORY** — Gather information or simulate outcomes. Do not take action.
+* **INNOVATIVE** — Propose alternative or creative solutions. Clearly mark speculation.
+* **ASSISTIVE** — Explain what will happen, highlight risks, and ask for confirmation if needed.
+
+This taxonomy is intentionally small. Its power comes from enforcement, not granularity.
+
+---
+
+## 3. Behavioral Rules by Intent
+
+| Intent      | Allowed Behavior           | Forbidden Behavior             |
+| ----------- | -------------------------- | ------------------------------ |
+| DIRECT      | Execute exactly            | Guessing, retrying, explaining |
+| EXPLORATORY | Inspect, simulate, analyze | Mutating state                 |
+| INNOVATIVE  | Suggest alternatives       | Silent execution               |
+| ASSISTIVE   | Explain and confirm        | Acting without consent         |
+
+The model is no longer responsible for inferring the correct mode — it is declared explicitly.
+
+---
+
+## 4. OpenAI Function Calling Example
+
+### 4.1 Tool Definition
 
 ```python
 tools = [
     {
         "type": "function",
-        "function": {
-            "name": "execute_command",
-            "description": "Execute a shell command",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The command to execute"
-                    },
-                    "intent": {
-                        "type": "string",
-                        "enum": ["DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE"],
-                        "description": "Execution mode: DIRECT=execute exactly, EXPLORATORY=analyze options, INNOVATIVE=suggest alternatives, ASSISTIVE=explain before executing"
-                    }
+        "name": "execute_command",
+        "description": "Execute a shell command",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute"
                 },
-                "required": ["command", "intent"]
-            }
+                "intent": {
+                    "type": "string",
+                    "enum": ["DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE"],
+                    "description": "Behavioral execution mode"
+                }
+            },
+            "required": ["command", "intent"]
         }
     }
 ]
-
-# In your system prompt:
-system_prompt = """
-When calling tools, the 'intent' parameter defines your behavior:
-- DIRECT: Call the tool exactly as requested. No additional suggestions.
-- EXPLORATORY: Use the tool to gather information. Present options.
-- INNOVATIVE: Propose creative solutions using this tool.
-- ASSISTIVE: Explain what the tool will do. Ask for confirmation if destructive.
-
-Do not override user intent. If information is missing and intent is DIRECT, respond with "CANNOT_PROCEED: missing required parameter X" instead of guessing.
-"""
 ```
 
-### Anthropic Claude
+### 4.2 System Prompt Enforcement
+
+```text
+When calling tools, you MUST include an intent.
+
+DIRECT:
+- Execute exactly as requested
+- No suggestions or explanations
+- If information is missing, respond: CANNOT_PROCEED: <reason>
+
+EXPLORATORY:
+- Investigate only
+- Do not mutate state
+
+INNOVATIVE:
+- Propose alternatives
+- Label speculation
+
+ASSISTIVE:
+- Explain effects
+- Warn before destructive actions
+
+Never override user intent.
+```
+
+### 4.3 Execution Layer (Kill Switch)
+
+```python
+def handle_tool_call(call):
+    intent = call["arguments"]["intent"]
+    command = call["arguments"]["command"]
+
+    if intent == "DIRECT":
+        if not command:
+            return "CANNOT_PROCEED: missing command"
+        return run(command)
+
+    if intent == "EXPLORATORY":
+        return simulate(command)
+
+    if intent == "ASSISTIVE":
+        return explain_and_confirm(command)
+
+    if intent == "INNOVATIVE":
+        return suggest_alternatives(command)
+```
+
+This logic functions as a **circuit breaker**: execution is impossible unless the declared intent permits it.
+
+---
+
+## 5. Anthropic Claude Example
 
 ```python
 tools = [
@@ -96,208 +150,74 @@ tools = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": ["read", "write", "delete"],
-                    "description": "File operation to perform"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "File path"
-                },
+                "operation": {"type": "string", "enum": ["read", "write", "delete"]},
+                "path": {"type": "string"},
                 "intent": {
                     "type": "string",
-                    "enum": ["DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE"],
-                    "description": "DIRECT: execute immediately | EXPLORATORY: show what would happen | INNOVATIVE: suggest alternatives | ASSISTIVE: guide user through decision"
+                    "enum": ["DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE"]
                 }
             },
             "required": ["operation", "path", "intent"]
         }
     }
 ]
-
-# System prompt addition:
-"""
-Tool Intent Rules:
-- DIRECT mode: Execute the tool call. Stop immediately after. No explanations unless the tool fails.
-- EXPLORATORY mode: Use tools to gather data. Present findings without taking action.
-- INNOVATIVE mode: You may propose alternative tool uses if they better solve the problem.
-- ASSISTIVE mode: Explain tool effects before use. Highlight risks.
-
-If you cannot fulfill a DIRECT intent request exactly, respond: "CANNOT_PROCEED: [reason]" and stop.
-"""
 ```
 
-### Google Gemini
-
-```python
-tools = [
-    {
-        "function_declarations": [
-            {
-                "name": "database_query",
-                "description": "Execute a database query",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "SQL query to execute"
-                        },
-                        "intent": {
-                            "type": "string",
-                            "enum": ["DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE"],
-                            "description": "Behavioral mode: DIRECT=execute only, EXPLORATORY=explain results, INNOVATIVE=suggest optimizations, ASSISTIVE=validate before running"
-                        }
-                    },
-                    "required": ["query", "intent"]
-                }
-            }
-        ]
-    }
-]
-
-# System instruction:
-"""
-You have access to tools with an 'intent' parameter. This parameter is mandatory and controls your behavior:
-
-DIRECT: Execute the tool exactly as specified. Output only the result. Do not add commentary, suggestions, or alternatives.
-
-EXPLORATORY: Use the tool to investigate. Present what you found. Do not make decisions or take further action.
-
-INNOVATIVE: You may suggest better approaches using this tool. Clearly mark speculative ideas.
-
-ASSISTIVE: Explain the tool's effect in plain language. For destructive operations, warn the user.
-
-Never guess parameters. Never retry with alternatives unless intent is INNOVATIVE. If a DIRECT operation cannot be completed, output "CANNOT_PROCEED: [specific reason]" and stop.
-"""
-```
-
-### xAI Grok
-
-```python
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "api_call",
-            "description": "Make an HTTP API request",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "endpoint": {"type": "string"},
-                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
-                    "body": {"type": "object"},
-                    "intent": {
-                        "type": "string",
-                        "enum": ["DIRECT", "EXPLORATORY", "INNOVATIVE", "ASSISTIVE"],
-                        "description": "DIRECT: make the call | EXPLORATORY: describe what the call would do | INNOVATIVE: suggest alternative endpoints | ASSISTIVE: explain risks and confirm"
-                    }
-                },
-                "required": ["endpoint", "method", "intent"]
-            }
-        }
-    }
-]
-
-# System context:
-"""
-Tool calls include an 'intent' parameter that defines operational boundaries:
-
-- DIRECT: Make the call. Return the response. Do not interpret, summarize, or editorialize.
-- EXPLORATORY: Describe what this API call would return. Do not actually make the call unless explicitly confirmed.
-- INNOVATIVE: Propose alternative API calls that might better achieve the goal.
-- ASSISTIVE: Explain what will happen in user-friendly terms. Highlight side effects.
-
-Hard rule: In DIRECT mode, if you lack required information, output "CANNOT_PROCEED: missing [parameter]" - do not infer, do not substitute, do not assume.
-"""
-```
+Claude is explicitly instructed to halt after DIRECT execution and never retry with alternatives unless intent allows it.
 
 ---
 
-## Usage Patterns
+## 6. Gemini and Grok Compatibility
 
-### Pattern 1: Strict Automation
-```python
-user_message = "Deploy to production"
-intent = "DIRECT"  # No safety rails, just execute
-```
+Because intent is application‑level metadata, the pattern is portable across providers. Any API that supports structured tool schemas can enforce intent deterministically in the executor layer.
 
-### Pattern 2: Safe Exploration
-```python
-user_message = "What would happen if I deleted this table?"
-intent = "EXPLORATORY"  # Investigate but don't act
-```
-
-### Pattern 3: Guided Learning
-```python
-user_message = "Help me optimize this query"
-intent = "INNOVATIVE"  # AI can suggest creative solutions
-```
-
-### Pattern 4: User Hand-Holding
-```python
-user_message = "Migrate the database"
-intent = "ASSISTIVE"  # Explain steps, ask for confirmation
-```
+The model suggests actions; your system decides whether they are allowed.
 
 ---
 
-## System Prompt Template
+## 7. Intent in Normal Chat
 
-Add this to your base system prompt:
+Intent is not limited to tools.
+
+### Example
 
 ```
-You are operating in an intent-driven execution environment.
-
-Every tool call includes an 'intent' parameter that defines your behavior:
-
-DIRECT:
-- Execute exactly what is requested
-- Output only the result
-- No suggestions, alternatives, or commentary
-- If information is missing: respond "CANNOT_PROCEED: [reason]" and stop
-- No "let me try another way" - halt on failure
-
-EXPLORATORY:
-- Use tools to gather information
-- Present options clearly
-- Do not commit to a solution
-- Label all assumptions
-
-INNOVATIVE:
-- Propose novel approaches
-- Clearly distinguish facts from speculation
-- May suggest alternative tools or methods
-
-ASSISTIVE:
-- Explain what will happen before acting
-- Highlight risks and side effects
-- Ask clarifying questions if needed
-- Confirm destructive operations
-
-CRITICAL RULES:
-1. Never override the declared intent
-2. Never guess missing parameters in DIRECT mode
-3. Never add "helpful" commentary in DIRECT mode
-4. Stop immediately when you've fulfilled the request
-5. Treat missing information as a blocker, not a prompt to be creative
+[INTENT: ASSISTIVE]
+Migrate the production database
 ```
+
+The model is constrained to explanation and confirmation.
+
+```
+[INTENT: DIRECT]
+List all running containers
+```
+
+The model must respond concisely and exactly.
+
+This dramatically reduces conversational drift in operational chat interfaces.
 
 ---
 
-## Why This Works
+## 8. Why This Works
 
-**Simple**: One parameter. Four values. Clear rules.
+* **Deterministic** — Behavior is constrained by declaration, not inference
+* **Minimal** — One parameter, no classifiers, no fine‑tuning
+* **Universal** — Works with any LLM that supports tool calls
+* **Composable** — Integrates cleanly with RAG, agents, and automation
 
-**Universal**: Works with any LLM API that supports tool calling.
+Most importantly, it acknowledges a core truth: *hallucinations are often a policy mismatch, not a knowledge failure*.
 
-**Deterministic**: Intent defines behavior boundaries. No drift.
+---
 
-**Practical**: Solves the real problem - unwanted "helpfulness" that causes hallucinations.
+## 9. Conclusion
+
+Intent‑Driven Tool Use reframes hallucination mitigation as a control‑surface problem rather than a modeling problem. By explicitly declaring behavioral intent at the boundary between language and action, we can preserve creativity where it is valuable — and enforce determinism where it is required.
+
+The result is safer automation, cleaner agents, and models that finally stop “helping” when you didn’t ask them to.
 
 ---
 
 ## License
 
-MIT - do whatever you want with this.
+MIT — use it, fork it, ship it.
